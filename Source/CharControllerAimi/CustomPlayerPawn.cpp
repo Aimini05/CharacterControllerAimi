@@ -8,8 +8,15 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/OverlapResult.h"
+#include "Engine/Engine.h"
+#include "Components/PrimitiveComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "DrawDebugHelpers.h"
+#include "PlayerMovementStateBase.h"
+#include "GroundedState.h"
+#include "JumpingState.h"
+#include "FallingState.h"
 
 ACustomPlayerPawn::ACustomPlayerPawn()
 {
@@ -47,9 +54,16 @@ ACustomPlayerPawn::ACustomPlayerPawn()
     FirstPersonCamera->SetActive(false);
 }
 
+ACustomPlayerPawn::~ACustomPlayerPawn() = default;
+
 void ACustomPlayerPawn::BeginPlay()
 {
     Super::BeginPlay();
+    
+    if (GEngine)
+    {
+        GEngine->AddOnScreenDebugMessage(-1, 5.f, FColor::Red, TEXT("BeginPlay works"));
+    }
 
     if (APlayerController* PC = Cast<APlayerController>(GetController()))
     {
@@ -64,6 +78,15 @@ void ACustomPlayerPawn::BeginPlay()
                 }
             }
         }
+    }
+    
+    if (IsGrounded())
+    {
+        ChangeState(MakeUnique<FGroundedState>());
+    }
+    else
+    {
+        ChangeState(MakeUnique<FFallingState>());
     }
 }
 
@@ -88,6 +111,7 @@ void ACustomPlayerPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputCo
     if (JumpAction)
     {
         EnhancedInput->BindAction(JumpAction, ETriggerEvent::Started, this, &ACustomPlayerPawn::Input_JumpStarted);
+        EnhancedInput->BindAction(JumpAction, ETriggerEvent::Completed, this, &ACustomPlayerPawn::Input_JumpReleased);
     }
 
     if (ToggleCameraAction)
@@ -100,13 +124,50 @@ void ACustomPlayerPawn::Tick(float DeltaTime)
 {
     Super::Tick(DeltaTime);
 
+    const bool bGroundedNow = IsGrounded();
+
+    // Coyote timer
+    if (bGroundedNow)
+    {
+        CoyoteTimer = CoyoteTime;
+    }
+    else
+    {
+        CoyoteTimer = FMath::Max(0.f, CoyoteTimer - DeltaTime);
+    }
+
+    // Jump buffer timer
+    if (JumpBufferTimer > 0.f)
+    {
+        JumpBufferTimer = FMath::Max(0.f, JumpBufferTimer - DeltaTime);
+    }
+
     UpdateState(DeltaTime);
     UpdateCamera(DeltaTime);
     UpdateMovement(DeltaTime);
+
+    // Försök använda buffered jump innan movement löses klart
+    TryConsumeBufferedJump();
+
     SolveCollisionAndMove(DeltaTime);
     Depenetrate();
 
-    bJumpPressed = false;
+    bWasGroundedLastFrame = bGroundedNow;
+    
+    if (CurrentMovementState)
+    {
+        CurrentMovementState->Update(this, DeltaTime);
+    }
+    
+    if (CurrentMovementState && GEngine)
+    {
+        GEngine->AddOnScreenDebugMessage(
+            -1,
+            0.f,
+            FColor::Green,
+            CurrentMovementState->GetName()
+        );
+    }
 }
 
 void ACustomPlayerPawn::Input_Move(const FInputActionValue& Value)
@@ -139,7 +200,19 @@ void ACustomPlayerPawn::Input_Look(const FInputActionValue& Value)
 
 void ACustomPlayerPawn::Input_JumpStarted(const FInputActionValue& Value)
 {
-    bJumpPressed = true;
+    bJumpHeld = true;
+    JumpBufferTimer = JumpBufferTime;
+}
+
+void ACustomPlayerPawn::Input_JumpReleased(const FInputActionValue& Value)
+{
+    bJumpHeld = false;
+
+    // Variabel hopphöjd: om spelaren släpper hopp medan den fortfarande rör sig uppåt
+    if (Velocity.Z > 0.f)
+    {
+        Velocity.Z *= JumpCutMultiplier;
+    }
 }
 
 void ACustomPlayerPawn::Input_ToggleCamera(const FInputActionValue& Value)
@@ -155,14 +228,7 @@ void ACustomPlayerPawn::UpdateState(float DeltaTime)
 
     if (bGrounded)
     {
-        if (bJumpPressed)
-        {
-            CurrentState = EPlayerMovementState::Jumping;
-        }
-        else
-        {
-            CurrentState = EPlayerMovementState::Grounded;
-        }
+        CurrentState = EPlayerMovementState::Grounded;
     }
     else
     {
@@ -195,12 +261,6 @@ void ACustomPlayerPawn::UpdateMovement(float DeltaTime)
     // Gravity
     Velocity.Z -= Gravity * DeltaTime;
     Velocity.Z = FMath::Clamp(Velocity.Z, -MaxFallSpeed, MaxFallSpeed);
-
-    // Jump
-    if (CurrentState == EPlayerMovementState::Jumping && IsGrounded())
-    {
-        Velocity.Z = JumpImpulse;
-    }
 
     // Horisontell acceleration
     ApplyHorizontalAcceleration(DeltaTime);
@@ -387,10 +447,11 @@ void ACustomPlayerPawn::Depenetrate()
 
     for (const FOverlapResult& Overlap : Overlaps)
     {
-        if (!Overlap.Component.IsValid()) continue;
+        UPrimitiveComponent* OverlapComp = Overlap.GetComponent();
+        if (!OverlapComp) continue;
 
         FMTDResult MTD;
-        const bool bHasPenetration = Overlap.Component->ComputePenetration(
+        const bool bHasPenetration = OverlapComp->ComputePenetration(
             MTD,
             FCollisionShape::MakeCapsule(
                 Capsule->GetScaledCapsuleRadius() + ColliderMargin,
@@ -407,5 +468,52 @@ void ACustomPlayerPawn::Depenetrate()
             Velocity += NormalForce;
             break;
         }
+    }
+}
+
+bool ACustomPlayerPawn::CanUseCoyoteJump() const
+{
+    return CoyoteTimer > 0.f;
+}
+
+void ACustomPlayerPawn::TryConsumeBufferedJump()
+{
+    if (JumpBufferTimer <= 0.f)
+    {
+        return;
+    }
+
+    if (CanUseCoyoteJump())
+    {
+        Velocity.Z = JumpImpulse;
+
+        JumpBufferTimer = 0.f;
+        CoyoteTimer = 0.f;
+        CurrentState = EPlayerMovementState::Jumping;
+    }
+}
+
+void ACustomPlayerPawn::ChangeState(TUniquePtr<FPlayerMovementStateBase> NewState)
+{
+    if (CurrentMovementState)
+    {
+        CurrentMovementState->Exit(this);
+    }
+
+    CurrentMovementState = MoveTemp(NewState);
+
+    if (CurrentMovementState)
+    {
+        if (GEngine)
+        {
+            GEngine->AddOnScreenDebugMessage(
+                -1,
+                2.f,
+                FColor::Green,
+                CurrentMovementState->GetName()
+            );
+        }
+
+        CurrentMovementState->Enter(this);
     }
 }
